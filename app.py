@@ -1,11 +1,13 @@
 import os
 import json
-from typing import List, Dict, Any
+import base64
+from typing import List, Dict, Any, Optional
 
 import cv2
 import numpy as np
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_DIR = os.path.join(BASE_DIR, "db_images")
@@ -19,6 +21,12 @@ bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 db_cache: List[Dict[str, Any]] = []
 
 
+class MatchRequest(BaseModel):
+    image_base64: str
+    file_name: Optional[str] = "upload.jpg"
+    mime_type: Optional[str] = "image/jpeg"
+
+
 def read_manifest():
     with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -28,7 +36,6 @@ def load_image_gray(path: str):
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         return None
-    # 統一縮放，讓比對更穩
     h, w = img.shape[:2]
     max_side = max(h, w)
     if max_side > 1200:
@@ -51,11 +58,8 @@ def score_match(desc1, desc2):
         return 0
 
     matches = sorted(matches, key=lambda x: x.distance)
-
-    # 取前 80 個最好 match
     good = matches[:80]
 
-    # distance 越小越好，轉成分數
     score = 0
     for m in good:
         score += max(0, 100 - m.distance)
@@ -90,6 +94,60 @@ def build_db_cache():
     return cache
 
 
+def decode_uploaded_image(content: bytes):
+    np_arr = np.frombuffer(content, np.uint8)
+    img = cv2.imdecode(np_arr, cv2.IMREAD_GRAYSCALE)
+
+    if img is None:
+        return None
+
+    h, w = img.shape[:2]
+    max_side = max(h, w)
+    if max_side > 1200:
+        scale = 1200 / max_side
+        img = cv2.resize(img, None, fx=scale, fy=scale)
+
+    return img
+
+
+def run_match(img):
+    kp, desc = compute_features(img)
+
+    if desc is None:
+        return {
+            "ok": True,
+            "best_match_id": "",
+            "best_match_name": "",
+            "best_match_text": "",
+            "score": 0,
+            "top3": [],
+            "reason": "上傳圖片無法提取足夠特徵"
+        }
+
+    results = []
+    for item in db_cache:
+        score = score_match(desc, item["descriptors"])
+        results.append({
+            "id": item["id"],
+            "name": item["name"],
+            "text": item["text"],
+            "score": score
+        })
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    top3 = results[:3]
+    best = top3[0] if top3 else {"id": "", "name": "", "text": "", "score": 0}
+
+    return {
+        "ok": True,
+        "best_match_id": best["id"],
+        "best_match_name": best["name"],
+        "best_match_text": best["text"],
+        "score": best["score"],
+        "top3": top3
+    }
+
+
 @app.on_event("startup")
 def startup_event():
     global db_cache
@@ -102,12 +160,16 @@ def root():
     return {"ok": True, "message": "Calligraphy Matcher API is running"}
 
 
+@app.get("/health")
+def health():
+    return {"status": "ok", "db_count": len(db_cache)}
+
+
 @app.post("/match")
 async def match_calligraphy(file: UploadFile = File(...)):
     try:
         content = await file.read()
-        np_arr = np.frombuffer(content, np.uint8)
-        img = cv2.imdecode(np_arr, cv2.IMREAD_GRAYSCALE)
+        img = decode_uploaded_image(content)
 
         if img is None:
             return JSONResponse(
@@ -115,47 +177,37 @@ async def match_calligraphy(file: UploadFile = File(...)):
                 content={"ok": False, "error": "無法讀取上傳圖片"}
             )
 
-        h, w = img.shape[:2]
-        max_side = max(h, w)
-        if max_side > 1200:
-            scale = 1200 / max_side
-            img = cv2.resize(img, None, fx=scale, fy=scale)
+        return run_match(img)
 
-        kp, desc = compute_features(img)
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": str(e)}
+        )
 
-        if desc is None:
-            return {
-                "ok": True,
-                "best_match_id": "",
-                "best_match_name": "",
-                "best_match_text": "",
-                "score": 0,
-                "top3": [],
-                "reason": "上傳圖片無法提取足夠特徵"
-            }
 
-        results = []
-        for item in db_cache:
-            score = score_match(desc, item["descriptors"])
-            results.append({
-                "id": item["id"],
-                "name": item["name"],
-                "text": item["text"],
-                "score": score
-            })
+@app.post("/match-json")
+async def match_calligraphy_json(payload: MatchRequest):
+    try:
+        raw = (payload.image_base64 or "").strip()
 
-        results.sort(key=lambda x: x["score"], reverse=True)
-        top3 = results[:3]
-        best = top3[0] if top3 else {"id": "", "name": "", "text": "", "score": 0}
+        # 若前端不小心帶 data:image/...;base64, 也一起清掉
+        if raw.startswith("data:"):
+            raw = raw.split(",", 1)[-1]
 
-        return {
-            "ok": True,
-            "best_match_id": best["id"],
-            "best_match_name": best["name"],
-            "best_match_text": best["text"],
-            "score": best["score"],
-            "top3": top3
-        }
+        image_bytes = base64.b64decode(raw)
+        img = decode_uploaded_image(image_bytes)
+
+        if img is None:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": "無法解析 base64 圖片"}
+            )
+
+        result = run_match(img)
+        result["input_file_name"] = payload.file_name
+        result["input_mime_type"] = payload.mime_type
+        return result
 
     except Exception as e:
         return JSONResponse(
